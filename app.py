@@ -18,10 +18,15 @@ Highlights:
 """
 
 import secrets
+import time
+from datetime import datetime, timedelta
 
-from flask import (Flask, abort, flash, redirect, render_template, request,
-                   session, url_for)
+from flask import (Flask, Response, abort, flash, redirect, render_template,
+                   request, session, url_for)
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from sqlalchemy import or_
+
+from ml_classifier import predict_category
 
 from config import DevelopmentConfig
 from models import (ACTIVE_STATUSES, ROLES, TICKET_CATEGORIES, TICKET_PRIORITIES,
@@ -30,6 +35,53 @@ from models import (ACTIVE_STATUSES, ROLES, TICKET_CATEGORIES, TICKET_PRIORITIES
 app = Flask(__name__)
 app.config.from_object(DevelopmentConfig)
 db.init_app(app)
+
+# Keep metric labels bounded: request.endpoint is the Flask route name, so
+# ticket numbers and other user-provided path values never become labels.
+HTTP_REQUESTS = Counter(
+    "helpdesk_http_requests_total",
+    "HTTP requests served by the helpdesk application.",
+    ("method", "endpoint", "status"),
+)
+HTTP_ERRORS = Counter(
+    "helpdesk_http_errors_total",
+    "HTTP responses with an error status (400 or higher).",
+    ("method", "endpoint", "status"),
+)
+HTTP_REQUEST_DURATION = Histogram(
+    "helpdesk_http_request_duration_seconds",
+    "Time spent serving helpdesk HTTP requests, in seconds.",
+    ("method", "endpoint"),
+)
+
+
+@app.before_request
+def start_request_timer():
+    request.environ["helpdesk_started_at"] = time.perf_counter()
+
+
+@app.after_request
+def record_request_metrics(response):
+    # Scrapes should not change the traffic measurements they are reading.
+    if request.endpoint != "metrics":
+        endpoint = request.endpoint or "unknown"
+        method = request.method
+        status = str(response.status_code)
+        HTTP_REQUESTS.labels(method, endpoint, status).inc()
+        if response.status_code >= 400:
+            HTTP_ERRORS.labels(method, endpoint, status).inc()
+        started_at = request.environ.get("helpdesk_started_at")
+        if started_at is not None:
+            HTTP_REQUEST_DURATION.labels(method, endpoint).observe(
+                time.perf_counter() - started_at
+            )
+    return response
+
+
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    """Expose Prometheus metrics without requiring an application login."""
+    return Response(generate_latest(), content_type=CONTENT_TYPE_LATEST)
 
 
 # ---------------------------------------------------------------------------
@@ -270,11 +322,117 @@ def login():
     return render_template("login.html")
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["POST"])
 def logout():
     session.clear()
     flash("You have been signed out.", "info")
     return redirect(url_for("login"))
+
+
+def dashboard_ticket_trend(query=None):
+    """Return real ticket creation counts for the last seven calendar days."""
+    today = utcnow().date()
+    first_day = today - timedelta(days=6)
+    start = datetime.combine(first_day, datetime.min.time())
+    ticket_query = query or Ticket.query
+    rows = (
+        ticket_query.with_entities(
+            db.func.date(Ticket.created_at), db.func.count(Ticket.id)
+        )
+        .filter(Ticket.created_at >= start)
+        .group_by(db.func.date(Ticket.created_at))
+        .all()
+    )
+    counts = {str(day): count for day, count in rows}
+    return [
+        {
+            "date": (first_day + timedelta(days=offset)),
+            "count": counts.get(
+                (first_day + timedelta(days=offset)).isoformat(), 0
+            ),
+        }
+        for offset in range(7)
+    ]
+
+
+def response_sla_overdue(query):
+    """Find active tickets whose first-response target has already elapsed."""
+    now = utcnow()
+    targets = app.config["SLA_HOURS"]
+    overdue = []
+    for ticket in query.filter(Ticket.status.in_(ACTIVE_STATUSES)).all():
+        target_hours = targets.get(ticket.priority)
+        if target_hours is None:
+            continue
+        response_at = ticket.assigned_at or now
+        if response_at - ticket.created_at > timedelta(hours=target_hours):
+            overdue.append(ticket)
+    return overdue
+
+
+def suggest_priority(title, description):
+    """Suggest a priority from explicit severity terms in the ticket text."""
+    text = f"{title} {description}".lower()
+    critical_terms = (
+        "server down", "system unavailable", "production issue",
+        "production outage", "critical failure", "security breach",
+        "security issue", "security incident", "ransomware", "business blocked",
+        "unable to work", "service outage",
+    )
+    high_terms = (
+        "application unavailable", "system not working", "major functionality",
+        "cannot access", "can't access", "unable to access",
+        "team blocked", "work is blocked",
+    )
+    low_terms = (
+        "minor", "cosmetic", "how do i", "how to", "information request",
+        "feature request", "general question", "non-urgent", "non urgent",
+    )
+
+    if any(term in text for term in critical_terms):
+        return "Critical"
+    if any(term in text for term in high_terms):
+        return "High"
+    if any(term in text for term in low_terms):
+        return "Low"
+    return "Medium"
+
+
+def engineer_workload():
+    """Aggregate assigned, in-progress, and resolved tickets per engineer."""
+    engineers = User.query.filter_by(role="engineer").order_by(User.name).all()
+    active_rows = (
+        db.session.query(Ticket.assigned_to_id, Ticket.status, db.func.count(Ticket.id))
+        .filter(
+            Ticket.assigned_to_id.isnot(None),
+            Ticket.status.in_(ACTIVE_STATUSES),
+        )
+        .group_by(Ticket.assigned_to_id, Ticket.status)
+        .all()
+    )
+    resolved_rows = (
+        db.session.query(Ticket.assigned_to_id, db.func.count(Ticket.id))
+        .filter(Ticket.assigned_to_id.isnot(None), Ticket.status == "Resolved")
+        .group_by(Ticket.assigned_to_id)
+        .all()
+    )
+    active_counts = {
+        (engineer_id, status): count
+        for engineer_id, status, count in active_rows
+    }
+    resolved_counts = dict(resolved_rows)
+    return [
+        {
+            "engineer": engineer,
+            "active": sum(
+                active_counts.get((engineer.id, status), 0)
+                for status in ACTIVE_STATUSES
+            ),
+            "in_progress": active_counts.get((engineer.id, "In Progress"), 0),
+            "resolved": resolved_counts.get(engineer.id, 0),
+        }
+        for engineer in engineers
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +442,10 @@ def logout():
 @login_required
 def dashboard(_user):
     """Role-aware overview of ticket statistics and recent activity."""
+    dashboard_date = utcnow().date()
 
     if _user.is_admin():
+        trend = dashboard_ticket_trend()
         stats = {
             "total": Ticket.query.count(),
             "open": Ticket.query.filter_by(status="Open").count(),
@@ -297,20 +457,67 @@ def dashboard(_user):
             "engineers": User.query.filter_by(role="engineer").count(),
             "employees": User.query.filter_by(role="employee").count(),
         }
+        all_tickets = Ticket.query
+        resolved_tickets = Ticket.query.filter(
+            Ticket.status == "Resolved", Ticket.resolved_at.isnot(None)
+        ).all()
+        resolution_times = [
+            ticket.resolution_time_seconds()
+            for ticket in resolved_tickets
+            if ticket.resolution_time_seconds() is not None
+        ]
+        stats["average_resolution_seconds"] = (
+            int(sum(resolution_times) / len(resolution_times))
+            if resolution_times else None
+        )
+        stats["resolution_samples"] = len(resolution_times)
+        stats["sla_breached"] = len(response_sla_overdue(all_tickets))
         recent = Ticket.query.order_by(Ticket.created_at.desc()).limit(8).all()
+        recent_resolved = (
+            Ticket.query.filter(
+                Ticket.status == "Resolved", Ticket.resolved_at.isnot(None)
+            )
+            .order_by(Ticket.resolved_at.desc())
+            .limit(5)
+            .all()
+        )
+        critical_tickets = (
+            Ticket.query.filter(
+                Ticket.priority == "Critical",
+                Ticket.status.in_(ACTIVE_STATUSES),
+            )
+            .order_by(Ticket.created_at.asc())
+            .limit(5)
+            .all()
+        )
         recent_activity = ActivityLog.query.order_by(
             ActivityLog.timestamp.desc()
         ).limit(8).all()
         status_rows = db.session.query(
             Ticket.status, db.func.count(Ticket.id)
         ).group_by(Ticket.status).all()
+        priority_rows = db.session.query(
+            Ticket.priority, db.func.count(Ticket.id)
+        ).group_by(Ticket.priority).all()
+        category_rows = db.session.query(
+            Ticket.category, db.func.count(Ticket.id)
+        ).group_by(Ticket.category).all()
         return render_template(
             "dashboard.html", stats=stats, recent=recent,
             recent_activity=recent_activity,
             tickets_by_status={status: count for status, count in status_rows},
+            tickets_by_priority={priority: count for priority, count in priority_rows},
+            tickets_by_category={category: count for category, count in category_rows},
+            recent_resolved=recent_resolved,
+            critical_tickets=critical_tickets,
+            engineer_workload=engineer_workload(),
+            ticket_trend=trend,
+            sla_overdue=response_sla_overdue(all_tickets),
+            dashboard_date=dashboard_date,
         )
 
     if _user.is_engineer():
+        trend = dashboard_ticket_trend()
         # Statistics -------------------------------------------------------
         stats = {
             "open_unassigned": Ticket.query.filter_by(status="Open").count(),
@@ -326,6 +533,24 @@ def dashboard(_user):
             ).count(),
             "total_open": Ticket.query.filter(Ticket.status.in_(ACTIVE_STATUSES)).count(),
         }
+        resolved_tickets = Ticket.query.filter(
+            Ticket.assigned_to_id == _user.id,
+            Ticket.status == "Resolved",
+            Ticket.resolved_at.isnot(None),
+        ).all()
+        resolution_times = [
+            ticket.resolution_time_seconds()
+            for ticket in resolved_tickets
+            if ticket.resolution_time_seconds() is not None
+        ]
+        stats["average_resolution_seconds"] = (
+            int(sum(resolution_times) / len(resolution_times))
+            if resolution_times else None
+        )
+        stats["resolution_samples"] = len(resolution_times)
+        stats["sla_breached"] = len(response_sla_overdue(
+            Ticket.query.filter(Ticket.assigned_to_id == _user.id)
+        ))
 
         # Queues -----------------------------------------------------------
         unassigned = (
@@ -344,6 +569,28 @@ def dashboard(_user):
             .all()
         )
         recent = Ticket.query.order_by(Ticket.created_at.desc()).limit(5).all()
+        recent_resolved = (
+            Ticket.query.filter(
+                Ticket.assigned_to_id == _user.id,
+                Ticket.status == "Resolved",
+                Ticket.resolved_at.isnot(None),
+            )
+            .order_by(Ticket.resolved_at.desc())
+            .limit(5)
+            .all()
+        )
+        critical_tickets = (
+            Ticket.query.filter(
+                Ticket.priority == "Critical",
+                Ticket.status.in_(ACTIVE_STATUSES),
+            )
+            .order_by(Ticket.created_at.asc())
+            .limit(5)
+            .all()
+        )
+        sla_overdue = response_sla_overdue(
+            Ticket.query.filter(Ticket.assigned_to_id == _user.id)
+        )
 
         # Active tickets grouped by priority, for the bar chart.
         rows = (
@@ -358,6 +605,12 @@ def dashboard(_user):
             "dashboard.html", stats=stats, unassigned=unassigned,
             my_tickets=my_tickets, recent=recent,
             tickets_by_priority=tickets_by_priority,
+            recent_resolved=recent_resolved,
+            critical_tickets=critical_tickets,
+            engineer_workload=engineer_workload(),
+            ticket_trend=trend,
+            sla_overdue=sla_overdue,
+            dashboard_date=dashboard_date,
         )
 
     # ---------------- Employee view ----------------
@@ -377,8 +630,32 @@ def dashboard(_user):
             1 for t in my_tickets if t.is_active() and t.priority == "Critical"
         ),
     }
+    resolved_tickets = [
+        ticket for ticket in my_tickets
+        if ticket.status == "Resolved" and ticket.resolved_at is not None
+    ]
+    resolution_times = [
+        ticket.resolution_time_seconds()
+        for ticket in resolved_tickets
+        if ticket.resolution_time_seconds() is not None
+    ]
+    stats["average_resolution_seconds"] = (
+        int(sum(resolution_times) / len(resolution_times))
+        if resolution_times else None
+    )
+    stats["resolution_samples"] = len(resolution_times)
+    employee_sla_overdue = response_sla_overdue(
+        Ticket.query.filter(Ticket.reported_by_id == _user.id)
+    )
+    stats["sla_breached"] = len(employee_sla_overdue)
     return render_template(
-        "dashboard.html", stats=stats, my_tickets=my_tickets[:5]
+        "dashboard.html", stats=stats, my_tickets=my_tickets[:5],
+        recent_resolved=resolved_tickets[:5],
+        sla_overdue=employee_sla_overdue,
+        ticket_trend=dashboard_ticket_trend(
+            Ticket.query.filter(Ticket.reported_by_id == _user.id)
+        ),
+        dashboard_date=dashboard_date,
     )
 
 
@@ -406,9 +683,16 @@ def list_tickets(_user):
     category = request.args.get("category", "")
     priority = request.args.get("priority", "")
     status = request.args.get("status", "")
+    assignee = request.args.get("assignee", "").strip()
+    sla = request.args.get("sla", "").strip()
     scope = request.args.get("scope", "all")  # engineers only
     sort = request.args.get("sort", "created")
     order = request.args.get("order", "desc")
+    engineers = (
+        User.query.filter_by(role="engineer").order_by(User.name).all()
+        if _user.is_engineer() or _user.is_admin()
+        else []
+    )
 
     tickets = Ticket.query
 
@@ -434,6 +718,26 @@ def list_tickets(_user):
         tickets = tickets.filter(Ticket.priority == priority)
     if status:
         tickets = tickets.filter(Ticket.status == status)
+    if _user.is_engineer() or _user.is_admin():
+        if assignee == "unassigned":
+            tickets = tickets.filter(Ticket.assigned_to_id.is_(None))
+        elif assignee:
+            engineer_ids = {str(engineer.id) for engineer in engineers}
+            if assignee in engineer_ids:
+                tickets = tickets.filter(
+                    Ticket.assigned_to_id == int(assignee)
+                )
+            else:
+                flash("Please select a valid engineer.", "warning")
+                assignee = ""
+    else:
+        assignee = ""
+    if sla not in ("", "overdue"):
+        flash("Please select a valid SLA filter.", "warning")
+        sla = ""
+    if sla == "overdue":
+        overdue_ids = [ticket.id for ticket in response_sla_overdue(tickets)]
+        tickets = tickets.filter(Ticket.id.in_(overdue_ids))
 
     column = SORT_COLUMNS.get(sort, Ticket.created_at)
     column = column.desc() if order == "desc" else column.asc()
@@ -445,11 +749,60 @@ def list_tickets(_user):
         categories=TICKET_CATEGORIES,
         priorities=TICKET_PRIORITIES,
         statuses=TICKET_STATUSES,
+        engineers=engineers,
         filters={
             "q": query, "category": category, "priority": priority,
-            "status": status, "scope": scope, "sort": sort, "order": order,
+            "status": status, "assignee": assignee, "sla": sla,
+            "scope": scope, "sort": sort, "order": order,
         },
     )
+
+
+@app.route("/api/predict-category", methods=["POST"])
+@login_required
+def predict_ticket_category(_user):
+    data = request.form
+    description = data.get("description", "")
+
+    if not isinstance(description, str):
+        return {"error": "Description must be text."}, 400
+
+    description = description.strip()
+    if len(description) < 5:
+        return {"error": "Enter at least 5 characters."}, 400
+
+    category = predict_category(description)
+    if category not in TICKET_CATEGORIES:
+        category = "Other"
+
+    return {"category": category}
+
+
+@app.route("/api/tickets/suggest", methods=["POST"])
+@login_required
+def suggest_ticket_fields(_user):
+    title = request.form.get("title", "").strip()
+    description = request.form.get("description", "").strip()
+
+    if len(title) < 5:
+        return {"error": "Enter a title with at least 5 characters."}, 400
+    if len(title) > 150:
+        return {"error": "Title must be 150 characters or fewer."}, 400
+    if len(description) < 20:
+        return {"error": "Enter a description with at least 20 characters."}, 400
+
+    category = predict_category(f"{title}\n{description}")
+    if category not in TICKET_CATEGORIES:
+        category = "Other"
+    priority = suggest_priority(title, description)
+    target_hours = app.config["SLA_HOURS"].get(priority)
+    sla = (
+        None
+        if target_hours is None
+        else f"{target_hours} hour{'s' if target_hours != 1 else ''}"
+    )
+
+    return {"category": category, "priority": priority, "sla": sla}
 
 
 @app.route("/tickets/new", methods=["GET", "POST"])
@@ -493,8 +846,12 @@ def new_ticket(_user):
             )
             return redirect(url_for("ticket_detail", ticket_number=ticket.ticket_number))
 
-    return render_template("ticket_form.html",
-                           categories=TICKET_CATEGORIES, priorities=TICKET_PRIORITIES)
+    return render_template(
+        "ticket_form.html",
+        categories=TICKET_CATEGORIES,
+        priorities=TICKET_PRIORITIES,
+        sla_targets=app.config["SLA_HOURS"],
+    )
 
 
 # ---------------------------------------------------------------------------

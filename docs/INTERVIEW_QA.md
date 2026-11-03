@@ -26,8 +26,9 @@ interview so they feel natural, then adapt the details to your own words.
 ## 3. How do users authenticate and how do you protect passwords?
 > Sessions. On login I store `user_id` in the Flask session and use
 > `@login_required` / `@engineer_required` decorators to gate routes.
-> Passwords are never stored — Werkzeug's `generate_password_hash()` stores a
-> PBKDF2-SHA256 hash, and `check_password_hash()` verifies on login.
+> Plain-text passwords are not stored — Werkzeug's
+> `generate_password_hash()` stores a password hash, and
+> `check_password_hash()` verifies it on login.
 
 ## 4. What stops an employee from seeing someone else's tickets?
 > Two layers. First, in `list_tickets` an employee's query is always filtered
@@ -74,7 +75,7 @@ interview so they feel natural, then adapt the details to your own words.
 ## 10. What security concerns did you handle?
 > Password hashing, CSRF tokens on every POST (checked in `before_request`),
 > role-based access control on every sensitive route, employee/engineer data
-> scoping, restricted `next` redirects, and safe rendering via Jinja which
+> scoping, POST-only logout, restricted `next` redirects, and safe rendering via Jinja which
 > auto-escapes all user content (no XSS). Sensitive config like the secret key
 > is overridable through environment variables.
 

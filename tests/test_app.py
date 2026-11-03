@@ -6,7 +6,9 @@ workflows, ticket lifecycle, validation, permissions, search/filter.
 Run with:  python -m pytest tests -v
 """
 
-from models import Ticket, User, db
+from datetime import timedelta
+
+from models import Ticket, User, db, utcnow
 
 
 # ---------------------------------------------------------------------------
@@ -17,6 +19,8 @@ def test_login_page_loads(client):
     assert resp.status_code == 200
     assert b"Smart IT Helpdesk" in resp.data
     assert b'name="csrf_token"' in resp.data
+    assert b"Engineer@123" not in resp.data
+    assert b"Employee@123" not in resp.data
     with client.session_transaction() as session:
         assert session.get("_csrf_token", "").encode() in resp.data
 
@@ -122,10 +126,32 @@ def test_registration_validates_password_mismatch(client, csrf):
     assert b"Passwords do not match" in resp.data
 
 
-def test_logout_clears_session(client, login):
+def test_logout_clears_session(client, login, csrf):
     login("rahul@techcorp.com", "Employee@123")
-    resp = client.get("/logout", follow_redirects=True)
+    resp = client.post(
+        "/logout", data={"csrf_token": csrf()}, follow_redirects=True
+    )
     assert b"Sign in to raise or resolve" in resp.data
+
+
+def test_logout_requires_csrf_token(client, login):
+    login("rahul@techcorp.com", "Employee@123")
+
+    resp = client.post("/logout")
+
+    assert resp.status_code == 400
+    with client.session_transaction() as session:
+        assert session.get("user_id") is not None
+
+
+def test_logout_is_not_exposed_as_a_get_action(client, login):
+    login("rahul@techcorp.com", "Employee@123")
+
+    resp = client.get("/logout")
+
+    assert resp.status_code == 405
+    with client.session_transaction() as session:
+        assert session.get("user_id") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +191,93 @@ def test_create_ticket_generates_number(client, login, csrf):
         assert ticket.status == "Open"
 
 
+def test_ticket_suggestions_reuse_classifier_and_configured_sla(client, login, csrf):
+    login("rahul@techcorp.com", "Employee@123")
+    response = client.post("/api/tickets/suggest", data={
+        "title": "Office WiFi connection is down",
+        "description": "The office WiFi cannot connect and the whole team is unable to work.",
+        "csrf_token": csrf(),
+    })
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "category": "Network",
+        "priority": "Critical",
+        "sla": "1 hour",
+    }
+
+
+def test_ticket_suggestions_validate_empty_and_short_input(client, login, csrf):
+    login("rahul@techcorp.com", "Employee@123")
+    for data in (
+        {"title": "", "description": ""},
+        {"title": "Printer jam", "description": "Paper is stuck"},
+    ):
+        response = client.post(
+            "/api/tickets/suggest",
+            data={**data, "csrf_token": csrf()},
+        )
+        assert response.status_code == 400
+        assert "error" in response.get_json()
+
+
+def test_suggested_priority_and_sla_follow_configured_targets(client, login, csrf, app):
+    login("rahul@techcorp.com", "Employee@123")
+    cases = (
+        ("Production server down", "All production services are down.", "Critical"),
+        ("Application unavailable", "The main application is unavailable.", "High"),
+        ("Minor display issue", "A minor cosmetic issue affects one icon.", "Low"),
+        ("Printer tray warning", "The printer tray indicator is blinking.", "Medium"),
+    )
+    for title, description, expected_priority in cases:
+        response = client.post("/api/tickets/suggest", data={
+            "title": title,
+            "description": description,
+            "csrf_token": csrf(),
+        })
+        expected_hours = app.config["SLA_HOURS"][expected_priority]
+
+        assert response.status_code == 200
+        assert response.get_json()["priority"] == expected_priority
+        assert response.get_json()["sla"] == (
+            f"{expected_hours} hour{'s' if expected_hours != 1 else ''}"
+        )
+
+
+def test_ticket_suggestion_endpoint_requires_authentication(client, csrf):
+    response = client.post(
+        "/api/tickets/suggest",
+        data={
+            "title": "Office WiFi is down",
+            "description": "The office WiFi cannot connect for any employees.",
+            "csrf_token": csrf(),
+        },
+    )
+
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
+
+
+def test_ticket_creation_keeps_user_selected_values_over_suggestions(client, login, csrf):
+    login("rahul@techcorp.com", "Employee@123")
+    response = client.post("/tickets/new", data={
+        "title": "Office WiFi server down",
+        "description": "The office WiFi server is down and the team cannot work. "
+                       "This blocks our operations.",
+        "category": "Hardware",
+        "priority": "Low",
+        "csrf_token": csrf(),
+    })
+
+    assert response.status_code == 302
+    with client.application.app_context():
+        ticket = Ticket.query.filter_by(title="Office WiFi server down").first()
+        assert ticket is not None
+        assert ticket.category == "Hardware"
+        assert ticket.priority == "Low"
+        assert ticket.status == "Open"
+
+
 def test_create_ticket_form_renders_with_csrf_and_new_fields(client, login):
     login("rahul@techcorp.com", "Employee@123")
     response = client.get("/tickets/new")
@@ -172,6 +285,32 @@ def test_create_ticket_form_renders_with_csrf_and_new_fields(client, login):
     assert b'name="csrf_token"' in response.data
     assert b'name="title"' in response.data
     assert b'name="description"' in response.data
+    assert b"Smart Ticket Suggestions" in response.data
+    assert b'id="applySuggestions"' in response.data
+
+
+def test_category_prediction_api_returns_supported_category(client, login, csrf):
+    login("rahul@techcorp.com", "Employee@123")
+
+    response = client.post(
+        "/api/predict-category",
+        data={
+            "description": "my account is locked",
+            "csrf_token": csrf(),
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"category": "Account/Login"}
+
+
+def test_ticket_list_includes_updated_date(client, login):
+    login("rahul@techcorp.com", "Employee@123")
+
+    response = client.get("/tickets")
+
+    assert response.status_code == 200
+    assert b'<th scope="col">Updated</th>' in response.data
 
 
 def test_create_ticket_rejects_short_description(client, login, csrf):
@@ -298,6 +437,40 @@ def test_filter_by_category(client, login):
     assert b"TKT-2026-0002" in resp.data
 
 
+def test_filter_by_assignee_includes_unassigned_queue(client, login, ids):
+    login("anita@techcorp.com", "Engineer@123")
+    response = client.get("/tickets?assignee=unassigned")
+
+    assert response.status_code == 200
+    assert b"TKT-2026-0001" in response.data
+    assert b"TKT-2026-0003" in response.data
+    assert b"TKT-2026-0002" not in response.data
+    assigned_response = client.get(
+        f"/tickets?assignee={ids['anita']}"
+    )
+    assert b"TKT-2026-0002" in assigned_response.data
+    assert b"TKT-2026-0001" not in assigned_response.data
+
+
+def test_response_sla_filter_shows_only_overdue_active_tickets(
+    client, login, app
+):
+    with app.app_context():
+        critical_ticket = Ticket.query.filter_by(
+            ticket_number="TKT-2026-0003"
+        ).first()
+        critical_ticket.created_at = utcnow() - timedelta(hours=2)
+        db.session.commit()
+
+    login("anita@techcorp.com", "Engineer@123")
+    response = client.get("/tickets?sla=overdue")
+
+    assert response.status_code == 200
+    assert b"TKT-2026-0003" in response.data
+    assert b"TKT-2026-0001" not in response.data
+    assert b"Response SLA" in response.data
+
+
 def test_unassigned_scope(client, login):
     login("anita@techcorp.com", "Engineer@123")
     resp = client.get("/tickets?scope=unassigned")
@@ -338,6 +511,10 @@ def test_admin_dashboard_and_all_ticket_access(client, login):
     assert b"TKT-2026-0001" in tickets.data
     assert b"TKT-2026-0002" in tickets.data
     assert client.get("/tickets/TKT-2026-0002").status_code == 200
+    assert b"All tickets" in tickets.data
+    assert b"Ticket volume" in dashboard.data
+    assert b"ENGINEER WORKLOAD" in dashboard.data
+    assert b"Priority distribution" in dashboard.data
 
 
 def test_admin_and_engineer_directory_visibility(client, login):
@@ -432,9 +609,9 @@ def test_initialization_preserves_existing_ticket_records(app, monkeypatch):
 
 def test_latest_ui_assets_are_served(client):
     page = client.get("/login")
-    css = client.get("/static/css/style.css?v=premium-3")
-    js = client.get("/static/js/main.js?v=premium-2")
-    assert b"style.css?v=premium-3" in page.data
-    assert b"main.js?v=premium-2" in page.data
+    css = client.get("/static/css/style.css?v=automation-1")
+    js = client.get("/static/js/main.js?v=enterprise-7")
+    assert b"style.css?v=automation-1" in page.data
+    assert b"main.js?v=enterprise-7" in page.data
     assert css.status_code == 200 and b".app-sidebar" in css.data
     assert js.status_code == 200 and b"data-nav-toggle" in js.data

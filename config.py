@@ -46,6 +46,11 @@ class Config:
     # Deployments should set SECRET_KEY. Local runs keep a random key in the
     # ignored instance directory so sessions and CSRF tokens survive restarts.
     SECRET_KEY = os.environ.get("SECRET_KEY") or _load_or_create_local_secret()
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = "Lax"
+    SESSION_COOKIE_SECURE = os.environ.get(
+        "SESSION_COOKIE_SECURE", "0"
+    ).strip().lower() in {"1", "true", "yes"}
 
     # --- Database ----------------------------------------------------------
     # SQLite file lives inside the instance/ folder, which is git-ignored.

@@ -1,19 +1,139 @@
 {% extends "base.html" %}
 {% import "icons.html" as i %}
 {% block content %}
-<div class="page-intro"><div><h2>Tell us what’s going on</h2><p>Give the support team a few details so they can get started.</p></div></div>
+<div class="page-intro"><div><span class="section-kicker">SUPPORT REQUEST</span><h2>Create a ticket</h2><p>Share a few details and the support team will take it from there.</p></div></div>
 <div class="form-layout">
-  <section class="form-panel"><div class="form-panel-heading"><h2>New support request</h2><p>Fields marked with <span class="required-mark">*</span> are required.</p></div>
+  <section class="form-panel"><div class="form-panel-heading"><span class="form-step">01 <span>·</span> Ticket information</span><h2>What do you need help with?</h2><p>Fields marked with <span class="required-mark">*</span> are required.</p></div>
     <form method="post" id="ticketForm" novalidate><input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <div class="field-grid">
         <div class="field-block field-full"><label class="form-label" for="title">Subject <span class="required-mark">*</span></label><input type="text" class="form-control" id="title" name="title" required minlength="5" maxlength="150" placeholder="A short summary of the issue" value="{{ request.form.get('title','') }}"><div class="form-text">Use a few words that describe what is not working.</div></div>
-        <div class="field-block"><label class="form-label" for="category">Category <span class="required-mark">*</span></label><select class="form-select" id="category" name="category" required><option value="">Select a category</option>{% for c in categories %}<option value="{{ c }}" {% if request.form.get('category') == c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select></div>
+        <div class="field-block"><label class="form-label" for="category">Category <span class="required-mark">*</span></label><select class="form-select" id="category" name="category" required><option value="">Select a category</option>{% for c in categories %}<option value="{{ c }}" {% if request.form.get('category') == c %}selected{% endif %}>{{ c }}</option>{% endfor %}</select><div class="form-text">Review the suggested category or choose another.</div></div>
         <div class="field-block"><label class="form-label" for="priority">Priority <span class="required-mark">*</span></label><select class="form-select" id="priority" name="priority" required><option value="">Select priority</option>{% for p in priorities %}<option value="{{ p }}" {% if request.form.get('priority') == p %}selected{% endif %}>{{ p }}</option>{% endfor %}</select><div class="form-text">Choose Critical only when work is blocked or a major service is down.</div></div>
         <div class="field-block field-full"><label class="form-label" for="description">Describe the problem <span class="required-mark">*</span></label><textarea class="form-control" id="description" name="description" rows="7" required minlength="20" placeholder="What happened? When did it start? Which device or application is affected? What have you tried?">{{ request.form.get('description','') }}</textarea><div class="form-text">Include any error message and the steps that led to the issue. Minimum 20 characters.</div></div>
       </div>
-      <div class="form-actions"><a href="{{ url_for('list_tickets') }}" class="btn btn-outline-secondary">Cancel</a><button type="submit" class="btn btn-primary">{{ i.icon('plus',15) }} Submit request</button></div>
+      <section class="smart-suggestions" aria-labelledby="smartSuggestionsTitle">
+        <div class="smart-suggestions-heading">
+          <span class="smart-suggestions-icon" aria-hidden="true">{{ i.icon('spark',17) }}</span>
+          <div><h3 id="smartSuggestionsTitle">Smart Ticket Suggestions</h3><p>Recommendations update as you describe the issue. Review and apply them if they fit.</p></div>
+        </div>
+        <div class="smart-suggestions-grid">
+          <div class="smart-suggestion-item"><span>Predicted category</span><strong id="suggestedCategory">Waiting for details</strong></div>
+          <div class="smart-suggestion-item"><span>Suggested priority</span><strong id="suggestedPriority">Waiting for details</strong></div>
+          <div class="smart-suggestion-item"><span>Response SLA target</span><strong id="suggestedSla">—</strong></div>
+        </div>
+        <div class="smart-suggestions-footer">
+          <span class="smart-suggestions-note" id="suggestionStatus" role="status" aria-live="polite">Enter a title and description to get suggestions. Changing priority updates its SLA target.</span>
+          <button type="button" class="btn btn-outline-primary" id="applySuggestions" disabled>{{ i.icon('spark',15) }} Use suggestions</button>
+        </div>
+      </section>
+      <div class="form-actions"><a href="{{ url_for('list_tickets') }}" class="btn btn-outline-secondary">Cancel</a><button type="submit" class="btn btn-primary">{{ i.icon('plus',15) }} Create ticket</button></div>
     </form>
   </section>
   <aside class="helper-card"><span class="helper-icon">{{ i.icon('spark',18) }}</span><h3>Help us help you faster</h3><p>A clear description gives the team a head start and helps route your request to the right person.</p><ul><li>Tell us what you expected to happen.</li><li>Include any error text you can see.</li><li>Say when the issue started and who it affects.</li></ul></aside>
 </div>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+    const title = document.getElementById("title");
+    const description = document.getElementById("description");
+    const category = document.getElementById("category");
+    const priority = document.getElementById("priority");
+    const categoryOutput = document.getElementById("suggestedCategory");
+    const priorityOutput = document.getElementById("suggestedPriority");
+    const slaOutput = document.getElementById("suggestedSla");
+    const status = document.getElementById("suggestionStatus");
+    const applyButton = document.getElementById("applySuggestions");
+    const form = document.getElementById("ticketForm");
+    const slaTargets = {{ sla_targets|tojson }};
+    const suggestionUrl = {{ url_for('suggest_ticket_fields')|tojson }};
+
+    if (!title || !description || !category || !priority || !status || !form) return;
+
+    let debounceTimer;
+    let requestNumber = 0;
+    let suggestions = null;
+
+    function formatSla(hours) {
+        if (hours === undefined || hours === null) return "Not configured";
+        return hours + (hours === 1 ? " hour" : " hours");
+    }
+
+    function updateSla() {
+        const selectedPriority = priority.value || (suggestions && suggestions.priority);
+        slaOutput.textContent = selectedPriority
+            ? formatSla(slaTargets[selectedPriority])
+            : "—";
+    }
+
+    async function requestSuggestions(requestId, titleText, descriptionText) {
+        const formData = new FormData();
+        formData.append("csrf_token", form.querySelector('[name="csrf_token"]').value);
+        formData.append("title", titleText);
+        formData.append("description", descriptionText);
+
+        try {
+            const response = await fetch(suggestionUrl, {
+                method: "POST",
+                body: formData,
+                headers: { "Accept": "application/json" }
+            });
+            const result = await response.json();
+            if (!response.ok) {
+                throw new Error(result.error || "Could not predict the category.");
+            }
+            if (requestId !== requestNumber) return;
+            suggestions = result;
+            categoryOutput.textContent = result.category;
+            priorityOutput.textContent = result.priority;
+            updateSla();
+            applyButton.disabled = false;
+            status.textContent = "Suggestions are ready. They will not be applied until you choose Use suggestions.";
+        } catch (error) {
+            if (requestId === requestNumber) {
+                suggestions = null;
+                applyButton.disabled = true;
+                status.textContent = error.message || "Suggestions could not be loaded. Please try again.";
+                updateSla();
+            }
+        }
+    }
+
+    function scheduleSuggestions() {
+        window.clearTimeout(debounceTimer);
+        requestNumber += 1;
+        const titleText = title.value.trim();
+        const descriptionText = description.value.trim();
+        suggestions = null;
+        applyButton.disabled = true;
+
+        if (titleText.length < 5 || descriptionText.length < 20) {
+            categoryOutput.textContent = "Waiting for details";
+            priorityOutput.textContent = "Waiting for details";
+            status.textContent = "Enter at least 5 title characters and 20 description characters.";
+            updateSla();
+            return;
+        }
+
+        const requestId = requestNumber;
+        categoryOutput.textContent = "Analyzing…";
+        priorityOutput.textContent = "Analyzing…";
+        status.textContent = "Analyzing title and description…";
+        updateSla();
+        debounceTimer = window.setTimeout(
+            function () { requestSuggestions(requestId, titleText, descriptionText); },
+            350
+        );
+    }
+
+    title.addEventListener("input", scheduleSuggestions);
+    description.addEventListener("input", scheduleSuggestions);
+    priority.addEventListener("change", updateSla);
+    applyButton.addEventListener("click", function () {
+        if (!suggestions) return;
+        category.value = suggestions.category;
+        priority.value = suggestions.priority;
+        updateSla();
+        status.textContent = "Suggestions applied. You can still change category or priority.";
+    });
+});
+</script>
 {% endblock %}

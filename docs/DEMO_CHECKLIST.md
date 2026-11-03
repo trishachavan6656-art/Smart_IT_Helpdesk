@@ -7,11 +7,14 @@ below so the story flows: *an employee reports a problem → an engineer fixes i
 ---
 
 ## Phase 0 — Preparation
-- [ ] Run `python init_db.py` to reset sample data to a known state.
+- [ ] Run `python init_db.py` to create missing tables and seed an empty database.
+      This command does not reset or replace existing records; use a separate
+      disposable database if you need a repeatable clean demo.
 - [ ] Run `python app.py` and open `http://127.0.0.1:5000`.
 
 ## Phase 1 — Authentication (Employee)
-1. **Login page** — capture the clean card layout with demo credentials listed.
+1. **Login page** — capture the clean card layout. Use locally provisioned
+   accounts and do not include passwords in screenshots or published docs.
 2. **Register page** — create a brand-new employee account (explains self-service).
 3. **Employee dashboard** — capture the stat cards (Active / Resolved / Closed /
    Total / Critical) and the "My recent tickets" table.
@@ -28,7 +31,7 @@ below so the story flows: *an employee reports a problem → an engineer fixes i
 8. **Ticket detail (employee view)** — description, activity timeline start.
 
 ## Phase 3 — Engineering workflow (Engineer)
-9. **Engineer login** (anita@techcorp.com / Engineer@123).
+9. **Engineer login** — sign in with a locally provisioned engineer account.
 10. **Engineer dashboard** — capture: unassigned triage queue, cards (Open,
     Assigned to me, Resolved by me, Critical, Total active) and the priority
     bar chart.
@@ -81,9 +84,9 @@ Add a **Screenshots** section to the README:
 
 ## Live demo script (60–90 seconds)
 
-1. Log in as **Rahul Sharma** (employee).
+1. Log in using a locally provisioned employee account.
 2. Raise a *Printer* ticket with Medium priority.
-3. Log out, log in as **Anita Rao** (engineer).
+3. Log out, then log in using a locally provisioned engineer account.
 4. Point out the new ticket in the **unassigned triage queue**.
 5. Assign it to yourself → status becomes *Assigned*.
 6. Add troubleshooting notes → status *In Progress*.

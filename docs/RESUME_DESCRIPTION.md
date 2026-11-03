@@ -15,8 +15,8 @@ and archive them with a complete audit trail.
   with 7 categories, 4 priorities, auto-generated ticket IDs and a per-ticket
   **activity/audit log**, mirroring real-world tools such as Zendesk/ServiceNow.
 
-- **Implemented professional-grade security and data integrity**: PBKDF2
-  password hashing, CSRF protection on all POST requests, role-based access
+- **Implemented security and data integrity controls**: Werkzeug password
+  hashing, CSRF protection on all POST requests, role-based access
   control and server + client-side validation, ensuring employees can only
   access their own tickets.
 
@@ -27,7 +27,7 @@ and archive them with a complete audit trail.
 
 - **Delivered a role-aware dashboard** with an engineer triage queue, active
   tickets-by-priority chart and SLA indicators, plus search/filter/sort across
-  25+ realistic seeded tickets, and shipped **26 automated pytest cases**
+  25+ realistic seeded tickets, and shipped an automated pytest suite
   covering auth, permissions, workflows and validation.
 
 ### Variant / shorter version (if you need 2 bullets)
@@ -36,7 +36,7 @@ and archive them with a complete audit trail.
   ticket lifecycle management, audit logging and role-specific dashboards for
   employees and support engineers.
 - Secured the app with password hashing, CSRF tokens and role-based access,
-  and verified behavior through an automated **pytest suite (26 tests)**.
+  and verified behavior through an automated **pytest suite**.
 
 ---
 

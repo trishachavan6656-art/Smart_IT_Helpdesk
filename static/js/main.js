@@ -8,6 +8,7 @@
   var shell = document.querySelector(".app-shell");
   var navToggle = document.querySelector("[data-nav-toggle]");
   var navClose = document.querySelector("[data-nav-close]");
+  var sidebarCollapse = document.querySelector("[data-sidebar-collapse]");
 
   function closeNavigation() {
     if (!shell || !navToggle) return;
@@ -23,6 +24,31 @@
       navToggle.setAttribute("aria-label", isOpen ? "Close navigation" : "Open navigation");
     });
   }
+  if (sidebarCollapse && shell) {
+    sidebarCollapse.addEventListener("click", function () {
+      var isCollapsed = shell.classList.toggle("sidebar-collapsed");
+      sidebarCollapse.setAttribute("aria-pressed", String(isCollapsed));
+      sidebarCollapse.setAttribute(
+        "aria-label",
+        isCollapsed ? "Expand navigation" : "Collapse navigation"
+      );
+      sidebarCollapse.setAttribute(
+        "title",
+        isCollapsed ? "Expand navigation" : "Collapse navigation"
+      );
+    });
+  }
+  document.querySelectorAll("[data-password-toggle]").forEach(function (button) {
+    var input = document.getElementById(button.dataset.passwordToggle);
+    if (!input) return;
+    button.addEventListener("click", function () {
+      var isVisible = input.type === "text";
+      input.type = isVisible ? "password" : "text";
+      button.textContent = isVisible ? "Show" : "Hide";
+      button.setAttribute("aria-label", isVisible ? "Show password" : "Hide password");
+      button.setAttribute("aria-pressed", String(!isVisible));
+    });
+  });
   if (navClose) navClose.addEventListener("click", closeNavigation);
   document.addEventListener("keydown", function (event) {
     if (event.key === "Escape") closeNavigation();
@@ -38,9 +64,10 @@
       window.location.href = row.dataset.href;
     }
   });
-
   document.addEventListener("keydown", function (event) {
-    var row = event.target.closest("tr.clickable-row");
+    var target = event.target;
+    if (!target || typeof target.closest !== "function") return;
+    var row = target.closest("tr.clickable-row");
     if (row && row.dataset.href && (event.key === "Enter" || event.key === " ")) {
       event.preventDefault();
       window.location.href = row.dataset.href;
